@@ -94,7 +94,22 @@ MODULACAO_TO_CATEGORY = {
     "MESA LATERAL": "Mesa Lateral",
     "APARADOR": "Aparador",
     "BUFFET": "Buffet",
+    "BAR": "Buffet",  # "BAR" nos novos precos = categoria Buffet nas planilhas antigas
     "COMODA": "Cômoda",
+}
+
+# Acabamentos na tabela de novos precos equivalentes a NENHUM (sem topo especial):
+# produtos como Splendeur Cabeceira usam LAMINADO/LAQUEADA ao inves de NENHUM.
+NENHUM_EQUIVALENT_FINISHES = {
+    "LAMINADO", "LAMINADO ESPECIAL", "LAMINADO LAQUEADO",
+    "LAQUEADA", "LAQUEADA METALIZADO",
+}
+
+# Acabamentos na fonte legada equivalentes a NENHUM nos novos precos:
+LEGACY_NENHUM_FINISHES = {
+    "LAMINADO", "LAMINADO ESPECIAL", "LAMINADO LAQUEADO",
+    "LAQUEADA", "LAQUEADA METALIZADO", "LAQUEADA METALIZADOS",
+    "LAQUEADO", "LAQUEADO METALIZADO", "LAQUEADO METALIZADOS",
 }
 
 # indices fixos das colunas de acabamento nas planilhas antigas (linha de cabecalho
@@ -243,11 +258,14 @@ CONFIG_FIELDS = {
     "COMPRIMENTO DA MODULACAO": "C",
     "PROFUNDIDADE DA MODULACAO": "L",
     "ALTURA DA MODULACAO": "A",
+    "OPCAO DO TOPO INFERIOR": "topo_inferior",
+    "OPCAO DO TOPO SUPERIOR": "topo_superior",
 }
 
 
 def parse_config(text):
-    info = {"categoria_raw": None, "formato": None, "C": None, "L": None, "A": None}
+    info = {"categoria_raw": None, "formato": None, "C": None, "L": None, "A": None,
+            "topo_inferior": None, "topo_superior": None}
     if not text:
         return info
     cleaned = strip_accents(text).upper()
@@ -271,6 +289,10 @@ def parse_config(text):
                     info["L"] = num
                 else:
                     info["A"] = num
+        elif key == "OPCAO DO TOPO INFERIOR":
+            info["topo_inferior"] = val
+        elif key == "OPCAO DO TOPO SUPERIOR":
+            info["topo_superior"] = val
     return info
 
 
@@ -294,7 +316,7 @@ def load_new_products():
             groups[current] = {"display": display, "variants": []}
             order.append(current)
 
-        info = parse_config(config_text)
+        info = parse_config(config_text or "")
         finishes = {}
         for name, value in zip(header[2:], row[2:]):
             if name and value is not None:
@@ -303,6 +325,8 @@ def load_new_products():
             "categoria_raw": info["categoria_raw"],
             "formato": info["formato"],
             "C": info["C"], "L": info["L"], "A": info["A"],
+            "topo_inferior": info["topo_inferior"],
+            "topo_superior": info["topo_superior"],
             "finishes": finishes,
         })
 
@@ -357,6 +381,25 @@ def load_old_products():
     return by_category
 
 
+def pick_representative_variant(product):
+    """Escolhe UMA variante representativa do produto para analise.
+    Mesa de Jantar -> variante mais proxima de 2,70m (tamanho de referencia);
+    demais -> variante mais proxima da dimensao media (C+L+A) do produto."""
+    variants = product["variants"]
+    if len(variants) == 1:
+        return variants[0]
+    if product["categoria"] == "Mesa de Jantar":
+        with_c = [v for v in variants if isinstance(v["C"], (int, float))]
+        if with_c:
+            return min(with_c, key=lambda v: abs(v["C"] - 2.70))
+
+    def total_dim(v):
+        return (v["C"] or 0.0) + (v["L"] or 0.0) + (v["A"] or 0.0)
+
+    avg = sum(total_dim(v) for v in variants) / len(variants)
+    return min(variants, key=lambda v: abs(total_dim(v) - avg))
+
+
 def numeric_dim(value, fallback):
     """Converte dimensao para numero; usa 'fallback' quando o valor nao e numerico
     (ex.: o simbolo de diametro em mesas redondas, onde C='diametro' e L=valor)."""
@@ -396,20 +439,13 @@ def find_match(product, old_by_category):
     if not candidates:
         return None
 
-    best = None
-    for variant in product["variants"]:
-        for old_p in candidates:
-            score = dimension_diff(variant, old_p)
-            if best is None or score < best[0]:
-                best = (score, variant, old_p)
-    if best is None:
-        return None
-
-    score, variant, old_p = best
+    variant = pick_representative_variant(product)
+    best_old = min(candidates, key=lambda p: dimension_diff(variant, p))
+    score = dimension_diff(variant, best_old)
     tied_brands = sorted({c["brand"] for c in candidates
-                          if c["name"] == old_p["name"] and dimension_diff(variant, c) == score})
-    brand_label = "/".join(tied_brands) if tied_brands else old_p["brand"]
-    return {"variant": variant, "old": old_p, "brand_label": brand_label}
+                          if c["name"] == best_old["name"] and dimension_diff(variant, c) == score})
+    brand_label = "/".join(tied_brands) if tied_brands else best_old["brand"]
+    return {"variant": variant, "old": best_old, "brand_label": brand_label}
 
 
 # --------------------------------------------------------------------------- #
@@ -504,17 +540,9 @@ def find_legacy_match(product, legacy_products):
     if not candidates:
         return None
 
-    best = None
-    for variant in product["variants"]:
-        for old_p in candidates:
-            score = dimension_diff(variant, old_p)
-            if best is None or score < best[0]:
-                best = (score, variant, old_p)
-    if best is None:
-        return None
-
-    _, variant, old_p = best
-    return {"variant": variant, "old": old_p}
+    variant = pick_representative_variant(product)
+    best_old = min(candidates, key=lambda p: dimension_diff(variant, p))
+    return {"variant": variant, "old": best_old}
 
 
 # --------------------------------------------------------------------------- #
@@ -522,12 +550,24 @@ def find_legacy_match(product, legacy_products):
 # --------------------------------------------------------------------------- #
 
 def build_rows(variant, old_p, finish_order):
-    """Linhas de comparacao contra uma das 3 planilhas de marca (colunas fixas
-    de acabamento). Quando o acabamento novo nao tem correspondente preenchido
-    na planilha antiga, a linha e listada apenas como informativa (sem %)."""
+    """Linhas de comparacao contra uma das 3 planilhas de marca (colunas fixas).
+    - LAMINADO/LAQUEADA no novo sao tratados como NENHUM (mesma coluna antiga).
+    - Apos processar os novos acabamentos, adiciona linhas informativas para
+      colunas antigas com preco que nao tiveram equivalente novo."""
+    # Normaliza: se produto novo tem LAMINADO/LAQUEADA mas nao NENHUM,
+    # usa o primeiro equivalente como NENHUM.
+    eff = dict(variant["finishes"])
+    if "NENHUM" not in eff:
+        for eq in ("LAMINADO", "LAMINADO ESPECIAL", "LAMINADO LAQUEADO", "LAQUEADA", "LAQUEADA METALIZADO"):
+            if eq in eff:
+                eff["NENHUM"] = eff[eq]
+                break
+
     rows = []
+    covered_cols = set()
+
     for finish in finish_order:
-        new_price = variant["finishes"].get(finish)
+        new_price = eff.get(finish)
         if new_price is None:
             continue
         mapping = FINISH_MAP.get(finish) or ESP_FINISH_MAP.get(finish)
@@ -535,6 +575,7 @@ def build_rows(variant, old_p, finish_order):
             continue
         is_esp = finish in ESP_FINISH_MAP
         col_idx, factor = mapping
+        covered_cols.add(col_idx)
         old_raw = old_p["cols"][col_idx - COL_VIDRO_ESPELHO]
         if not isinstance(old_raw, (int, float)):
             rows.append({
@@ -554,32 +595,85 @@ def build_rows(variant, old_p, finish_order):
             "delta": delta, "pct": pct,
             "info_only": False, "is_esp": is_esp,
         })
+
+    # Linhas informativas reversas: colunas antigas com preco sem equivalente novo.
+    _col_labels = {
+        COL_VIDRO_ESPELHO: ("ESPELHO", False),
+        COL_LACA_VIDRO_NORMAL: ("NENHUM", False),
+        COL_MARMORE_ESPECIAL: ("MARMORE ESPECIAL", True),
+        COL_MARMORE_NORMAL: ("MARMORE", False),
+    }
+    for col_idx, (label, is_esp) in _col_labels.items():
+        if col_idx in covered_cols:
+            continue
+        old_raw = old_p["cols"][col_idx - COL_VIDRO_ESPELHO]
+        if not isinstance(old_raw, (int, float)):
+            continue
+        rows.append({
+            "finish": label,
+            "note": "sem equivalente na tabela atual",
+            "old": old_raw, "new": None,
+            "delta": None, "pct": None,
+            "info_only": True, "is_esp": is_esp,
+        })
     return rows
 
 
+_MARBLE_KEYWORDS = {"MARMORE", "PORCELANA"}
+
+
 def build_legacy_rows(variant, legacy_p, finish_order):
-    """Linhas de comparacao contra a fonte legada 'Precos antigos - Century e
-    .pv'. Ali o acabamento do tampo vem descrito na propria configuracao (nao em
-    colunas fixas), entao a comparacao e feita por NOME (mesmo vocabulario de
-    'Novos precos', com pequenas variacoes tratadas em LEGACY_FINISH_ALIASES).
+    """Linhas de comparacao contra a fonte legada 'Precos antigos - Century e .pv'.
 
-    Caso especial (instrucao do usuario): quando o produto novo nao diferencia
-    acabamentos e so tem o preco "NENHUM" preenchido (modelos "agrupados", ex.
-    SAMMY), esse preco unico e comparado contra CADA acabamento listado na fonte
-    legada para aquela configuracao - gerando uma linha por acabamento antigo.
+    Normalizacoes aplicadas:
+    - Novos: LAMINADO/LAQUEADA → tratados como NENHUM (mesma regra do build_rows).
+    - Antigos: LAMINADO/LAQUEADA/LAQUEADO e equivalentes → agrupados como NENHUM.
+    - Marmore unico: se o legado tiver apenas 1 tipo de marmore, usa esse preco
+      para todos os marmores normais (POLIDO, LEVIGADO, ESCOVADO) nos novos precos.
+    - Produto agrupado (NENHUM unico): se o novo so tem NENHUM preenchido, esse
+      preco e comparado contra TODOS os acabamentos do legado."""
 
-    Quando um acabamento existe de um lado mas nao do outro, a linha e listada
-    apenas como informativa (sem calculo de %), nos dois sentidos."""
-    new_finishes = {f: variant["finishes"][f] for f in finish_order if f in variant["finishes"]}
-    old_finishes = dict(legacy_p["finishes"])
-    if not new_finishes or not old_finishes:
+    # Normaliza novos: LAMINADO/LAQUEADA → NENHUM
+    eff_new = dict(variant["finishes"])
+    if "NENHUM" not in eff_new:
+        for eq in ("LAMINADO", "LAMINADO ESPECIAL", "LAMINADO LAQUEADO", "LAQUEADA", "LAQUEADA METALIZADO"):
+            if eq in eff_new:
+                eff_new["NENHUM"] = eff_new[eq]
+                break
+    # Remove os equivalentes para nao criar linhas duplicadas
+    for eq in NENHUM_EQUIVALENT_FINISHES:
+        eff_new.pop(eq, None)
+
+    new_in_order = {f: eff_new[f] for f in finish_order if f in eff_new}
+
+    # Normaliza antigos: agrupa LAMINADO/LAQUEADO → NENHUM
+    old_finishes = {}
+    nenhum_old = None
+    for name, price in legacy_p["finishes"].items():
+        norm_n = normalize_finish_name(name)
+        is_nenhum_eq = any(norm_n == normalize_finish_name(f) for f in LEGACY_NENHUM_FINISHES)
+        if is_nenhum_eq:
+            if nenhum_old is None:
+                nenhum_old = price
+        else:
+            old_finishes[name] = price
+    if nenhum_old is not None:
+        old_finishes["NENHUM"] = nenhum_old
+
+    if not new_in_order and not old_finishes:
         return []
+
+    # Regra de marmore unico: 1 marmore antigo → usado para todos os marmores normais novos
+    old_marbles = {n: p for n, p in old_finishes.items()
+                   if any(k in normalize_finish_name(n) for k in _MARBLE_KEYWORDS)}
+    single_marble_price = list(old_marbles.values())[0] if len(old_marbles) == 1 else None
 
     rows = []
 
-    if set(new_finishes) == {"NENHUM"}:
-        nenhum_price = new_finishes["NENHUM"]
-        for old_name, old_price in old_finishes.items():
+    # Caso especial: produto novo so tem NENHUM (agrupado, sem diferenciacao)
+    if set(new_in_order) == {"NENHUM"} and set(eff_new) == {"NENHUM"}:
+        nenhum_price = new_in_order["NENHUM"]
+        for old_name, old_price in legacy_p["finishes"].items():
             delta = nenhum_price - old_price
             pct = (delta / old_price) * 100 if old_price else 0.0
             rows.append({
@@ -591,26 +685,40 @@ def build_legacy_rows(variant, legacy_p, finish_order):
         return rows
 
     matched_old = set()
+    marble_covered = False  # rastreia se algum marmore ja usou o single_marble_price
+
     for finish in finish_order:
-        new_price = new_finishes.get(finish)
+        new_price = new_in_order.get(finish)
         if new_price is None:
             continue
         is_esp = finish in ESP_FINISH_MAP
         norm = normalize_finish_name(finish)
         old_match = None
+        old_price_val = None
+
+        # Busca direta por nome (incluindo aliases)
         for old_name in old_finishes:
             on = normalize_finish_name(old_name)
             if on == norm or LEGACY_FINISH_ALIASES.get(on) == norm or LEGACY_FINISH_ALIASES.get(norm) == on:
                 old_match = old_name
+                old_price_val = old_finishes[old_name]
                 break
-        if old_match is not None:
-            old_price = old_finishes[old_match]
-            matched_old.add(old_match)
-            delta = new_price - old_price
-            pct = (delta / old_price) * 100 if old_price else 0.0
+
+        # Regra de marmore unico: usa o preco do unico marmore antigo para todos
+        # os marmores normais novos (nao ESP)
+        if old_match is None and single_marble_price is not None and not is_esp:
+            if any(k in norm for k in _MARBLE_KEYWORDS) and "FORNECIDO" not in norm:
+                old_price_val = single_marble_price
+                marble_covered = True
+
+        if old_price_val is not None:
+            if old_match:
+                matched_old.add(old_match)
+            delta = new_price - old_price_val
+            pct = (delta / old_price_val) * 100 if old_price_val else 0.0
             rows.append({
                 "finish": finish, "note": None,
-                "old": old_price, "new": new_price, "delta": delta, "pct": pct,
+                "old": old_price_val, "new": new_price, "delta": delta, "pct": pct,
                 "info_only": False, "is_esp": is_esp,
             })
         else:
@@ -620,8 +728,12 @@ def build_legacy_rows(variant, legacy_p, finish_order):
                 "info_only": True, "is_esp": is_esp,
             })
 
+    # Acabamentos antigos sem equivalente novo → info-only
     for old_name, old_price in old_finishes.items():
         if old_name in matched_old:
+            continue
+        # Se o marmore unico ja foi usado nas linhas acima, nao duplicar
+        if marble_covered and old_name in old_marbles:
             continue
         rows.append({
             "finish": old_name, "note": "sem equivalente na tabela atual",
@@ -631,25 +743,87 @@ def build_legacy_rows(variant, legacy_p, finish_order):
     return rows
 
 
-def pick_representative_variant(product):
-    """Para produtos 'Sem Correspondente' (sem nenhuma referencia antiga), escolhe
-    UMA variante para exibir - mesma logica de 'uma config por produto' usada nos
-    produtos comparados. Mesa de Jantar -> variante mais proxima de 2,70m de
-    comprimento (tamanho de referencia do segmento); demais -> variante mais
-    proxima da dimensao media (C+L+A) do proprio produto."""
-    variants = product["variants"]
-    if len(variants) == 1:
-        return variants[0]
-    if product["categoria"] == "Mesa de Jantar":
-        with_c = [v for v in variants if isinstance(v["C"], (int, float))]
-        if with_c:
-            return min(with_c, key=lambda v: abs(v["C"] - 2.70))
+def build_eclipse_rows(product, old_by_category):
+    """Logica especial para Mesa Eclipse: os precos antigos cobriam apenas o topo
+    superior; os novos tem dois topos (inferior + superior). Para cada coluna de
+    acabamento antiga, mostra o intervalo de precos novos (min = sem topo inferior,
+    max = com o topo inferior mais caro) mantendo o topo superior fixo."""
+    categoria = product.get("categoria") or "Mesa de Centro"
+    candidates_pool = old_by_category.get(categoria, [])
+    new_tokens = core_tokens(product["display"])
+    if not new_tokens or not candidates_pool:
+        return None
+    keyword = new_tokens[0]
+    candidates = [p for p in candidates_pool if keyword in core_tokens(p["name"])]
+    if not candidates:
+        return None
 
-    def total_dim(v):
-        return (v["C"] or 0.0) + (v["L"] or 0.0) + (v["A"] or 0.0)
+    repr_v = pick_representative_variant(product)
+    best_old = min(candidates, key=lambda p: dimension_diff(repr_v, p))
 
-    avg = sum(total_dim(v) for v in variants) / len(variants)
-    return min(variants, key=lambda v: abs(total_dim(v) - avg))
+    # Identifica a marca predominante
+    score = dimension_diff(repr_v, best_old)
+    tied_brands = sorted({c["brand"] for c in candidates
+                          if c["name"] == best_old["name"] and dimension_diff(repr_v, c) == score})
+    brand_label = "/".join(tied_brands) if tied_brands else best_old["brand"]
+
+    # Agrupa variantes Eclipse por (C, L, A, topo_superior) → lista de (inferior, preco)
+    rc, rl, ra = repr_v["C"], repr_v["L"], repr_v["A"]
+    sup_groups = {}  # superior → [(inferior, price)]
+    for v in product["variants"]:
+        if v["C"] != rc or v["L"] != rl or v["A"] != ra:
+            continue
+        sup = v.get("topo_superior") or "NENHUM"
+        inf = v.get("topo_inferior") or "NENHUM"
+        price = v["finishes"].get("NENHUM")
+        if price is not None:
+            sup_groups.setdefault(sup, []).append((inf, price))
+
+    rows = []
+    for finish in FINISH_ORDER_ESP:
+        mapping = FINISH_MAP.get(finish) or ESP_FINISH_MAP.get(finish)
+        if mapping is None:
+            continue
+        col_idx, factor = mapping
+        old_raw = best_old["cols"][col_idx - COL_VIDRO_ESPELHO]
+        if not isinstance(old_raw, (int, float)):
+            continue
+        old_price = old_raw * factor
+        is_esp = finish in ESP_FINISH_MAP
+
+        combos = sup_groups.get(finish, [])
+        if not combos:
+            rows.append({
+                "finish": finish, "note": FINISH_NOTES.get(finish),
+                "old": old_price, "new": None, "delta": None, "pct": None,
+                "info_only": True, "is_esp": is_esp,
+            })
+            continue
+
+        sorted_combos = sorted(combos, key=lambda x: x[1])
+        min_inf, min_price = sorted_combos[0]
+        max_inf, max_price = sorted_combos[-1]
+
+        def eclipse_row(label, inf_label, new_p):
+            delta = new_p - old_price
+            pct = (delta / old_price) * 100 if old_price else 0.0
+            return {
+                "finish": label,
+                "note": f"topo inf.: {inf_label.lower()}",
+                "old": old_price, "new": new_p,
+                "delta": delta, "pct": pct,
+                "info_only": False, "is_esp": is_esp,
+            }
+
+        if min_price == max_price:
+            rows.append(eclipse_row(finish, min_inf, min_price))
+        else:
+            rows.append(eclipse_row(f"{finish} — mín", min_inf, min_price))
+            rows.append(eclipse_row(f"{finish} — máx", max_inf, max_price))
+
+    if not rows:
+        return None
+    return {"variant": repr_v, "old": best_old, "brand_label": brand_label, "rows": rows}
 
 
 def build_report_data():
@@ -659,7 +833,7 @@ def build_report_data():
 
     matched_by_cat = {cat: [] for cat in CATEGORY_ORDER}
     category_order = list(CATEGORY_ORDER)
-    unmatched = []
+    matched_names = set()  # display names que ja tem comparativo
 
     def ensure_cat(cat):
         if cat not in matched_by_cat:
@@ -667,7 +841,24 @@ def build_report_data():
             category_order.append(cat)
         return matched_by_cat[cat]
 
+    unmatched_candidates = []
+
     for product in new_products:
+        # Eclipse: logica especial de comparacao por topo superior
+        if "Eclipse" in product["display"]:
+            result = build_eclipse_rows(product, old_by_category)
+            if result:
+                cat = product["categoria"] or category_label(product["categoria_raw"])
+                ensure_cat(cat).append({
+                    "display": product["display"],
+                    "brand_label": result["brand_label"],
+                    "size": fmt_size(result["variant"]["C"], result["variant"]["L"], result["variant"]["A"]),
+                    "ref": result["old"]["name"],
+                    "rows": result["rows"],
+                })
+                matched_names.add(product["display"])
+                continue
+
         match = find_match(product, old_by_category)
         if match is not None:
             rows = build_rows(match["variant"], match["old"], FINISH_ORDER_ESP)
@@ -679,6 +870,7 @@ def build_report_data():
                     "ref": match["old"]["name"],
                     "rows": rows,
                 })
+                matched_names.add(product["display"])
                 continue
 
         legacy_match = find_legacy_match(product, legacy_products)
@@ -696,8 +888,21 @@ def build_report_data():
                     "ref": " · ".join(ref_parts),
                     "rows": rows,
                 })
+                matched_names.add(product["display"])
                 continue
 
+        unmatched_candidates.append(product)
+
+    # Dedup sem-correspondente: ignora variantes cujo display ja esta em matched,
+    # e mostra cada nome apenas uma vez.
+    seen_unmatched = set()
+    unmatched = []
+    for product in unmatched_candidates:
+        if product["display"] in matched_names:
+            continue
+        if product["display"] in seen_unmatched:
+            continue
+        seen_unmatched.add(product["display"])
         unmatched.append(product)
 
     return matched_by_cat, unmatched, category_order
@@ -756,6 +961,8 @@ body.no-esp tr.esp-row{display:none}body.no-esp .pblock.esp-only{display:none}
 .esp-switch[aria-checked="true"] .esp-switch-track{background:var(--ep)}.esp-switch[aria-checked="true"] .esp-switch-thumb{left:18px}
 .esp-switch-label{font-size:11px;font-weight:600;letter-spacing:.03em}
 tr.info-only .vr,tr.info-only .ab{color:var(--bl)}
+.pmeta-avg{font-size:10px;color:var(--mg);margin-top:5px}.pmeta-avg strong{font-weight:600}
+.pmeta-avg .up{color:var(--up)}.pmeta-avg .down{color:var(--dn)}.pmeta-avg .neutral{color:var(--nt)}
 """
 
 
@@ -826,6 +1033,24 @@ def render_summary_cards(matched_by_cat, category_order):
     return "".join(cards)
 
 
+def product_avg_html(product):
+    """Variacao media do produto (dual ESP/sem-ESP) para exibir no cabecalho."""
+    pcts_all  = [r["pct"] for r in product["rows"] if r["pct"] is not None]
+    pcts_nesp = [r["pct"] for r in product["rows"] if r["pct"] is not None and not r["is_esp"]]
+    if not pcts_all:
+        return ""
+
+    def avg_span(pcts):
+        if not pcts:
+            return '<span class="neutral">—</span>'
+        avg = sum(pcts) / len(pcts)
+        return f'<strong class="{variation_class(avg)}">{fmt_pct(avg)}</strong>'
+
+    esp_html   = f'Variação média: {avg_span(pcts_all)}'
+    noesp_html = f'Variação média: {avg_span(pcts_nesp)} <span style="color:var(--bl);font-size:9px">(sem ESP)</span>' if pcts_nesp else f'Variação média: {avg_span(pcts_all)}'
+    return f'<div class="pmeta-avg">{dual(esp_html, noesp_html)}</div>'
+
+
 def render_product_block(product):
     rows_html = []
     for r in product["rows"]:
@@ -850,9 +1075,10 @@ def render_product_block(product):
   <td class="vr {variation_class(r['pct'])}">{arrow(r['pct'])} {fmt_pct(r['pct'])}</td>
   <td class="ab {'up' if r['delta'] >= 0 else 'down'}">{fmt_brl_signed(r['delta'])}</td></tr>""")
     esp_only_cls = " esp-only" if not has_non_esp_rows(product) else ""
+    avg_html = product_avg_html(product)
     return f"""<div class="pblock{esp_only_cls}">
   <div class="ph"><div class="pname">{product['display']}</div>
-  <div class="pmeta"><span class="tag brand">{product['brand_label']}</span><span class="tag size">{product['size']}</span><span class="tag ref">{product['ref']}</span></div></div>
+  <div class="pmeta"><span class="tag brand">{product['brand_label']}</span><span class="tag size">{product['size']}</span><span class="tag ref">{product['ref']}</span></div>{avg_html}</div>
   <table class="ft"><thead><tr>
     <th class="th-fn">Acabamento</th>
     <th class="th-pr">Preço Anterior</th><th class="th-pr">Preço Novo</th>
@@ -880,28 +1106,23 @@ def render_category_section(cat, products):
 def render_unmatched(unmatched):
     if not unmatched:
         return ""
-    blocks = []
+    items = []
     for product in unmatched:
         variant = pick_representative_variant(product)
-        rows = []
-        for finish in FINISH_ORDER_ESP:
-            price = variant["finishes"].get(finish)
-            if price is None:
-                continue
-            cls_attr = ' class="esp-row"' if finish in ESP_FINISH_MAP else ""
-            rows.append(f'<tr{cls_attr}><td class="fn">{finish}</td><td class="pr new" colspan="4">{fmt_brl(price)}</td></tr>')
-        if not rows:
-            continue
         size = fmt_size(variant["C"], variant["L"], variant["A"])
-        blocks.append(f"""<div class="pblock no-match">
-  <div class="ph"><div class="pname">{product['display']} <span class="nm-badge">Sem correspondente — apenas listagem</span></div>
-  <div class="pmeta"><span class="tag brand">—</span><span class="tag size">{size}</span></div></div>
-  <table class="ft"><thead><tr><th class="th-fn">Acabamento</th><th class="th-pr" colspan="4">Preço Novo (configuração analisada)</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-</div>""")
+        cat = product["categoria"] or category_label(product["categoria_raw"])
+        items.append(
+            f'<div class="pblock no-match">'
+            f'<div class="ph"><div class="pname">{product["display"]} '
+            f'<span class="nm-badge">Sem correspondente</span></div>'
+            f'<div class="pmeta"><span class="tag brand">—</span>'
+            f'<span class="tag size">{size}</span>'
+            f'<span class="tag ref">{cat}</span></div></div></div>'
+        )
     return f"""<section class="csec" id="sec-sem-correspondente">
-  <div class="csec-hdr"><h2>Sem Correspondente</h2><span class="cbadge neutral">apenas listagem</span></div>
-  <div class="nm-intro">Produtos abaixo não possuem equivalente em nenhuma das fontes antigas (3 planilhas de marca + fonte legada Century/PV). É exibida apenas a configuração de tamanho mais representativa do produto (tamanho médio do produto, ou variante mais próxima de 2,70m para mesas de jantar), com os preços novos para referência.</div>
-  {''.join(blocks)}</section>"""
+  <div class="csec-hdr"><h2>Sem Correspondente</h2><span class="cbadge neutral">{len(unmatched)} produtos</span></div>
+  <div class="nm-intro">Produtos sem equivalente em nenhuma das fontes antigas consultadas (3 planilhas de marca + fonte legada Century/PV).</div>
+  {''.join(items)}</section>"""
 
 
 def render_page(matched_by_cat, unmatched, category_order):
